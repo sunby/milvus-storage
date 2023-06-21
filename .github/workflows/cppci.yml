@@ -18,7 +18,7 @@ jobs:
       - name: Install dependencies
         uses: aminya/setup-cpp@v1
         with: 
-          conan: true
+          conan: 1.58.0
           cmake: true
 
       - name: setup conan
