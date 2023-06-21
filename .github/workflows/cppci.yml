@@ -22,12 +22,13 @@ jobs:
           cmake: true
 
       - name: Build
+        working-directory: ./cpp
         run: |
           mkdir build && cd build
           conan install .. 
           conan build ..
 
       - name : Test
-        working-directory: ./build
+        working-directory: ./cpp/build
         run: 
           ctest .
