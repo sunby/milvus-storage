@@ -22,8 +22,8 @@ jobs:
           cmake: true
 
       - name: Build
-        working-directory: ./build
         run: |
+          mkdir build && cp build
           conan install .. 
           conan build ..
 
