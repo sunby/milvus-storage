@@ -11,7 +11,7 @@ on:
     - '!go/**'
 jobs:
   unittest:
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
 
@@ -30,7 +30,7 @@ jobs:
         working-directory: ./cpp
         run: |
           mkdir build && cd build
-          conan install .. 
+          conan install .. --build missing
           conan build ..
 
       - name : Test
