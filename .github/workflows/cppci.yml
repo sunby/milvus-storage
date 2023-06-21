@@ -23,7 +23,7 @@ jobs:
 
       - name: Build
         run: |
-          mkdir build && cp build
+          mkdir build && cd build
           conan install .. 
           conan build ..
 
