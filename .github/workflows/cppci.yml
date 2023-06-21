@@ -21,6 +21,11 @@ jobs:
           conan: true
           cmake: true
 
+      - name: setup conan
+        run: 
+          conan remote add default-conan-local https://milvus01.jfrog.io/artifactory/api/conan/default-conan-local
+      
+
       - name: Build
         working-directory: ./cpp
         run: |
