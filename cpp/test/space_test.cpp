@@ -59,6 +59,7 @@ TEST(SpaceTest, SpaceWriteReadTest) {
   auto write_option = WriteOption{10};
   space->Write(reader.get(), &write_option);
 
+  // pk filter
   std::unique_ptr<Filter> filter = std::make_unique<ConstantFilter>(EQUAL, "pk_field", Value::Int64(1));
   auto read_options = std::make_shared<ReadOptions>();
   read_options->filters.push_back(std::move(filter));
@@ -71,6 +72,13 @@ TEST(SpaceTest, SpaceWriteReadTest) {
   ASSERT_EQ(pk_chunk->length(), 1);
   auto pk_arr = dynamic_cast<arrow::Int64Array*>(pk_chunk.get());
   ASSERT_EQ(1, pk_arr->Value(0));
+
+  // no filter
+  read_options = std::make_shared<ReadOptions>();
+  read_options->columns.emplace_back("pk_field");
+  read_options->columns.emplace_back("ts_field");
+  read_options->columns.emplace_back("vec_field");
+  res_reader = space->Read(read_options);
 }
 /**
  * @brief Test Space::Read
