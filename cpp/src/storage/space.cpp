@@ -237,6 +237,7 @@ Result<std::unique_ptr<Space>> Space::Open(const std::string& uri, Options optio
   RETURN_ARROW_NOT_OK(uri_parser.Parse(uri));
   path = uri_parser.path();
 
+  LOG_STORAGE_DEBUG_ << "Open space: " << path;
   RETURN_ARROW_NOT_OK(fs->CreateDir(GetManifestDir(path)));
   RETURN_ARROW_NOT_OK(fs->CreateDir(GetScalarDataDir(path)));
   RETURN_ARROW_NOT_OK(fs->CreateDir(GetVectorDataDir(path)));
