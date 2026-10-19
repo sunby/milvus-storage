@@ -14,6 +14,7 @@
 
 #include "milvus-storage/manifest.h"
 
+#include <algorithm>
 #include <sstream>
 #include <cstring>
 #include <filesystem>
@@ -350,6 +351,79 @@ static inline std::string ToAbsolute(const std::string& path,
   return path;
 }
 
+// Internal index artifacts live outside the segment directory. Store their
+// relative paths on disk and expose complete keys to readers. Historical
+// complete keys are accepted without adding the segment's _index twice.
+static std::string ConvertIndexPath(const Index& index, const std::string& base_path, bool to_relative) {
+  const std::filesystem::path segment(base_path);
+  const auto partition = segment.parent_path();
+  const auto collection = partition.parent_path();
+  const auto insert_log = collection.parent_path();
+  const auto is_id = [](const std::filesystem::path& path) {
+    const auto id = path.filename().string();
+    return !id.empty() && std::all_of(id.begin(), id.end(), [](char c) { return c >= '0' && c <= '9'; });
+  };
+  // The old writer used <root>/insert_log/<collection>/<partition>/<segment>.
+  // Do not guess an owner or clean literal components of an unfamiliar base.
+  if (segment.lexically_normal().string() != base_path || insert_log.filename() != "insert_log" || !is_id(segment) ||
+      !is_id(partition) || !is_id(collection)) {
+    // Generic storage-library tables do not carry Milvus segment identities.
+    if (!to_relative) {
+      return ToAbsolute(index.path, base_path, milvus_storage::kIndexPath);
+    }
+    const auto index_dir = segment / milvus_storage::kIndexDir;
+    const std::filesystem::path artifact(index.path);
+    if (artifact.is_absolute() && index_dir.is_absolute()) {
+      return artifact.lexically_relative(index_dir).generic_string();
+    }
+    return ToRelative(index.path, base_path, milvus_storage::kIndexPath);
+  }
+  if (!to_relative && !index.path.empty() && index.path != "." && index.path != ".." &&
+      index.path.find('/') == std::string::npos) {
+    return ToAbsolute(index.path, base_path, milvus_storage::kIndexPath);
+  }
+  if (index.build_id <= 0 || index.index_version < 0 || index.index_store_path_version < 0) {
+    return index.path;
+  }
+
+  std::string suffix;
+  if (index.index_store_path_version == 0) {
+    suffix = fmt::format("index_files/{}/{}/{}/{}", index.build_id, index.index_version, partition.filename().string(),
+                         segment.filename().string());
+  } else {
+    suffix = fmt::format("index_v1/{}/{}/{}/{}/{}", collection.filename().string(), partition.filename().string(),
+                         segment.filename().string(), index.build_id, index.index_version);
+  }
+  const auto index_dir = segment / milvus_storage::kIndexDir;
+  const auto is_owned_artifact = [&suffix](const std::string& path) {
+    return path == suffix || path.ends_with("/" + suffix);
+  };
+  if (to_relative) {
+    const std::filesystem::path artifact(index.path);
+    if (!index.path.starts_with("../") && is_owned_artifact(index.path) &&
+        artifact.lexically_normal().string() == index.path) {
+      const auto relative = artifact.lexically_relative(index_dir).generic_string();
+      if (!relative.empty()) {
+        return relative;
+      }
+    }
+    // Already-relative writer inputs stay relative. Unknown/foreign paths
+    // are not repaired to this segment's artifacts.
+    return ToRelative(index.path, base_path, milvus_storage::kIndexPath);
+  }
+  if (index.path.starts_with("../")) {
+    const auto complete = ToAbsolute(index.path, base_path, milvus_storage::kIndexPath);
+    // A legacy local base can retain extra namespace components. Follow the
+    // actual relative walk, but require the exact owned layout and canonical
+    // encoding. The consumer still validates the configured storage root.
+    if (is_owned_artifact(complete) &&
+        std::filesystem::path(complete).lexically_relative(index_dir).generic_string() == index.path) {
+      return complete;
+    }
+  }
+  return index.path;
+}
+
 Manifest::Manifest(ColumnGroups column_groups,
                    const std::vector<DeltaLog>& delta_logs,
                    const std::map<std::string, Statistics>& stats,
@@ -554,9 +628,10 @@ Manifest Manifest::toRelativePaths(const std::string& base_path) const {
     }
   }
 
-  // normalize index paths (convert absolute to relative)
-  for (auto& idx : copy_manifest.indexes_) {
-    idx.path = ToRelative(idx.path, std::optional<std::string>(base_path), milvus_storage::kIndexPath);
+  // Loaded entries are complete keys, while newly staged entries may already
+  // be relative. Every owned artifact is serialized relative to _index.
+  for (auto& index : copy_manifest.indexes_) {
+    index.path = ConvertIndexPath(index, base_path, true);
   }
 
   // normalize LOB file paths (convert absolute to relative)
@@ -587,9 +662,10 @@ void Manifest::ToAbsolutePaths(const std::string& base_path) {
     }
   }
 
-  // denormalize index paths (convert relative to absolute)
-  for (auto& idx : indexes_) {
-    idx.path = ToAbsolute(idx.path, std::optional<std::string>(base_path), milvus_storage::kIndexPath);
+  // Resolve relative entries and retain historical complete keys. Reading
+  // only updates this loaded view; it never rewrites the stored manifest.
+  for (auto& index : indexes_) {
+    index.path = ConvertIndexPath(index, base_path, false);
   }
 
   // denormalize LOB file paths (convert relative to absolute)
