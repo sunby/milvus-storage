@@ -14,6 +14,7 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <filesystem>
 #include <memory>
 #include <string>
@@ -26,6 +27,7 @@
 #include "milvus-storage/common/config.h"
 #include "milvus-storage/common/layout.h"
 #include "milvus-storage/manifest.h"
+#include "milvus-storage/transaction/transaction.h"
 #include "test_env.h"
 
 namespace milvus_storage::test {
@@ -39,7 +41,8 @@ class ManifestTest : public ::testing::Test {
     ASSERT_STATUS_OK(InitTestProperties(properties_));
     ASSERT_AND_ASSIGN(fs_, GetFileSystem(properties_));
 
-    base_path_ = GetTestBasePath("manifest-test");
+    base_path_ =
+        GetTestBasePath("manifest-test-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     ASSERT_STATUS_OK(DeleteTestDir(fs_, base_path_));
     ASSERT_STATUS_OK(CreateTestDir(fs_, base_path_));
   }
@@ -47,8 +50,8 @@ class ManifestTest : public ::testing::Test {
   void TearDown() override { ASSERT_STATUS_OK(DeleteTestDir(fs_, base_path_)); }
 
   // Helper: write manifest and read it back via WriteTo/ReadFrom
-  std::shared_ptr<Manifest> RoundTrip(const Manifest& manifest, size_t version = 1) {
-    std::string path = get_manifest_filepath(base_path_, version);
+  std::shared_ptr<Manifest> RoundTrip(const Manifest& manifest, size_t version = 1, const std::string& base = "") {
+    std::string path = get_manifest_filepath(base.empty() ? base_path_ : base, version);
     auto status = Manifest::WriteTo(fs_, path, manifest);
     EXPECT_TRUE(status.ok()) << status.ToString();
     Manifest::CleanCache();
@@ -111,6 +114,162 @@ TEST_F(ManifestTest, KnownSizeSkipsMetadataLookup) {
   size = -1;
   EXPECT_TRUE(Manifest::WriteTo(fs_, path, manifest, &size).IsAlreadyExists());
   EXPECT_EQ(size, -1);
+}
+
+TEST_F(ManifestTest, IndexCompleteKeysAcrossRevisions) {
+  const std::vector<std::string> keys = {
+      "/var/lib/milvus/index_files/100/1/2/3",
+      "tenant/index_files/100/1/2/3",
+      "tenant/index_v1/1/2/3/100/1",
+      "tenant/insert_log/1/2/3/_index/vector",
+      "tenant//index_files/./100/../101/1/2/3",
+      "../opaque-object-key",
+      "s3://bucket/indexes/vector",
+  };
+  Manifest manifest;
+  for (size_t i = 0; i < keys.size(); ++i) {
+    manifest.indexes().push_back(Index{.column_name = "vector",
+                                       .index_type = "hnsw",
+                                       .path = keys[i],
+                                       .index_id = static_cast<int64_t>(i + 1),
+                                       .build_id = static_cast<int64_t>(100 + i),
+                                       .index_version = 1});
+  }
+  const auto base = base_path_ + "/insert_log/1/2/3";
+  auto first = RoundTrip(manifest, 1, base);
+  ASSERT_EQ(first->indexes().size(), keys.size());
+  for (size_t i = 0; i < keys.size(); ++i) {
+    EXPECT_EQ(first->indexes()[i].path, keys[i]);
+  }
+  // Reading an existing revision and publishing another must not reinterpret
+  // bucket-relative complete keys as paths under the manifest's _index.
+  auto second = RoundTrip(*first, 2, base);
+  ASSERT_EQ(second->indexes().size(), keys.size());
+  for (size_t i = 0; i < keys.size(); ++i) {
+    EXPECT_EQ(second->indexes()[i].path, keys[i]);
+  }
+}
+
+TEST_F(ManifestTest, IndexHistoricalMixedPaths) {
+  for (int32_t layout : {0, 1}) {
+    for (int relative_count : {0, 1, 9, 10}) {
+      SCOPED_TRACE("layout=" + std::to_string(layout) + ",relative=" + std::to_string(relative_count));
+      const auto root = base_path_ + "/" + std::to_string(layout) + "-" + std::to_string(relative_count);
+      const auto base = root + "/insert_log/1/2/3";
+      Manifest manifest;
+      std::vector<std::string> complete;
+      for (int i = 0; i < 10; ++i) {
+        const auto build = std::to_string(100 + i);
+        const auto suffix = layout == 0 ? "index_files/" + build + "/1/2/3" : "index_v1/1/2/3/" + build + "/1";
+        complete.push_back(root + "/" + suffix);
+        manifest.indexes().push_back(
+            Index{.column_name = "vector",
+                  .index_name = "vector_hnsw",
+                  .index_type = "HNSW",
+                  .path = i >= 10 - relative_count ? "../../../../../" + suffix : complete.back(),
+                  .field_id = 100,
+                  .index_id = 200 + i,
+                  .build_id = 100 + i,
+                  .index_version = 1,
+                  .num_rows = 2200,
+                  .serialized_size = 2048,
+                  .mem_size = 4096,
+                  .index_store_path_version = layout,
+                  .index_file_keys = {"_mem.index.bin"},
+                  .properties = {{"metric_type", "L2"}}});
+      }
+      // Seed the historical encoding from a generic table so the owned-index
+      // serializer cannot canonicalize it first. Copy the immutable object,
+      // byte-for-byte, to the real segment's metadata directory.
+      const auto seed = root + "/historical-seed";
+      const auto seed_path = get_manifest_filepath(seed, 1);
+      ASSERT_STATUS_OK(Manifest::WriteTo(fs_, seed_path, manifest));
+      ASSERT_STATUS_OK(fs_->CreateDir(get_manifest_path(base), true));
+      ASSERT_STATUS_OK(fs_->CopyFile(seed_path, get_manifest_filepath(base, 1)));
+      Manifest::CleanCache();
+      ASSERT_AND_ASSIGN(auto read, Manifest::ReadFrom(fs_, get_manifest_filepath(base, 1)));
+      ASSERT_EQ(read->indexes().size(), complete.size());
+      for (size_t i = 0; i < complete.size(); ++i) {
+        EXPECT_EQ(read->indexes()[i].path, complete[i]);
+        EXPECT_EQ(read->indexes()[i].properties, manifest.indexes()[i].properties);
+        EXPECT_EQ(read->indexes()[i].index_file_keys, manifest.indexes()[i].index_file_keys);
+      }
+      // This is the native transaction read used by C++ manifest consumers,
+      // not the Go index-info projection. Reopening must use the same rules.
+      ASSERT_AND_ASSIGN(auto txn, api::transaction::Transaction::Open(fs_, base, 1));
+      ASSERT_AND_ASSIGN(auto reopened, txn->GetManifest());
+      for (size_t i = 0; i < complete.size(); ++i) {
+        EXPECT_EQ(reopened->indexes()[i].path, complete[i]);
+      }
+      txn->UpdateStat("bloom_filter.100", Statistics{{base + "/_stats/bloom_filter.100/1"}, {}});
+      ASSERT_AND_ASSIGN(auto version, txn->Commit());
+      EXPECT_EQ(version, 2);
+      Manifest::CleanCache();
+      ASSERT_AND_ASSIGN(auto updated, Manifest::ReadFrom(fs_, get_manifest_filepath(base, version)));
+      for (size_t i = 0; i < complete.size(); ++i) {
+        EXPECT_EQ(updated->indexes()[i].path, complete[i]);
+      }
+    }
+  }
+}
+
+TEST_F(ManifestTest, IndexHistoricalPathsRequireExactIdentity) {
+  const auto base = base_path_ + "/insert_log/1/2/3";
+  const std::vector<std::string> paths = {
+      "../../../../../index_files/999/1/2/3",        // another build
+      "../../../../../index_files/100/2/2/3",        // another index version
+      "../../../../../index_files/100/1/20/3",       // another partition
+      "../../../../../index_files/100/1/2/30",       // another segment
+      "../../../../../index_v1/10/2/3/100/1",        // another collection/layout
+      "../../../../../index_files/100/1/2/3/extra",  // a longer prefix
+      "../../../../../index_files/100/1/2/3/../3",   // not the writer's spelling
+      "../../../../../../index_files/100/1/2/3",     // another root depth
+      "../opaque-object-key",
+      "tenant//index_files/./100/../101/1/2/3",
+      "s3://bucket/index_files/100/1/2/3",
+      "",
+  };
+  Manifest manifest;
+  for (size_t i = 0; i < paths.size(); ++i) {
+    manifest.indexes().push_back(
+        Index{.path = paths[i], .index_id = static_cast<int64_t>(i + 1), .build_id = 100, .index_version = 1});
+  }
+  ASSERT_STATUS_OK(Manifest::WriteTo(fs_, get_manifest_filepath(base, 1), manifest));
+  Manifest::CleanCache();
+  ASSERT_AND_ASSIGN(auto read, Manifest::ReadFrom(fs_, get_manifest_filepath(base, 1)));
+  ASSERT_EQ(read->indexes().size(), paths.size());
+  for (size_t i = 0; i < paths.size(); ++i) {
+    if (paths[i].starts_with("../../../../../../")) {
+      EXPECT_EQ(read->indexes()[i].path,
+                (std::filesystem::path(base) / milvus_storage::kIndexDir / paths[i]).lexically_normal().string());
+    } else {
+      EXPECT_EQ(read->indexes()[i].path, paths[i]);
+    }
+  }
+  // Generic tables retain ordinary relative-path semantics; their paths
+  // must not be reinterpreted as a Milvus segment namespace.
+  Manifest unrelated;
+  unrelated.indexes().push_back(
+      Index{.path = "../../../../../index_files/100/1/2/3", .build_id = 100, .index_version = 1});
+  auto unchanged = RoundTrip(unrelated);
+  EXPECT_EQ(unchanged->indexes()[0].path,
+            (std::filesystem::path(base_path_) / milvus_storage::kIndexDir / unrelated.indexes()[0].path)
+                .lexically_normal()
+                .string());
+}
+
+TEST_F(ManifestTest, HistoricalIndexReaderDoesNotHideReadErrors) {
+  const auto base = base_path_ + "/insert_log/1/2/3";
+  const auto path = get_manifest_filepath(base, 1);
+  ASSERT_FALSE(Manifest::ReadFrom(fs_, path).ok());
+  ASSERT_STATUS_OK(fs_->CreateDir(get_manifest_path(base), true));
+  ASSERT_AND_ASSIGN(auto out, fs_->OpenOutputStream(path));
+  ASSERT_STATUS_OK(out->Write("corrupt manifest"));
+  ASSERT_STATUS_OK(out->Close());
+  Manifest::CleanCache();
+  const auto corrupt = Manifest::ReadFrom(fs_, path);
+  ASSERT_FALSE(corrupt.ok());
+  EXPECT_TRUE(corrupt.status().IsInvalid());
 }
 
 TEST_F(ManifestTest, EmptyManifestRoundTrip) {
