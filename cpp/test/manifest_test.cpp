@@ -260,6 +260,23 @@ TEST_F(ManifestTest, IndexHistoricalPathsRequireExactIdentity) {
                 .string());
 }
 
+TEST_F(ManifestTest, SegmentRootedIndexPathsResolveUnderSegment) {
+  Manifest manifest;
+  manifest.indexes().push_back(
+      Index{.path = "100/1", .build_id = 100, .index_version = 1, .index_store_path_version = 2});
+  for (const auto& base : {base_path_ + "/insert_log/1/2/3", base_path_}) {
+    SCOPED_TRACE(base);
+    const auto complete = get_index_filepath(base, "100/1");
+    auto first = RoundTrip(manifest, 1, base);
+    ASSERT_EQ(first->indexes().size(), 1);
+    EXPECT_EQ(first->indexes()[0].path, complete);
+    // Publishing another revision stores the loaded complete key relative again.
+    auto second = RoundTrip(*first, 2, base);
+    ASSERT_EQ(second->indexes().size(), 1);
+    EXPECT_EQ(second->indexes()[0].path, complete);
+  }
+}
+
 TEST_F(ManifestTest, HistoricalIndexReaderDoesNotHideReadErrors) {
   const auto base = base_path_ + "/insert_log/1/2/3";
   const auto path = get_manifest_filepath(base, 1);
