@@ -351,7 +351,7 @@ static inline std::string ToAbsolute(const std::string& path,
   return path;
 }
 
-// Internal index artifacts live outside the segment directory. Store their
+// Layout 0 and 1 index artifacts live outside the segment directory. Store their
 // relative paths on disk and expose complete keys to readers. Historical
 // complete keys are accepted without adding the segment's _index twice.
 static std::string ConvertIndexPath(const Index& index, const std::string& base_path, bool to_relative) {
@@ -365,9 +365,11 @@ static std::string ConvertIndexPath(const Index& index, const std::string& base_
   };
   // The old writer used <root>/insert_log/<collection>/<partition>/<segment>.
   // Do not guess an owner or clean literal components of an unfamiliar base.
-  if (segment.lexically_normal().string() != base_path || insert_log.filename() != "insert_log" || !is_id(segment) ||
-      !is_id(partition) || !is_id(collection)) {
-    // Generic storage-library tables do not carry Milvus segment identities.
+  const bool historical_layout = index.index_store_path_version == 0 || index.index_store_path_version == 1;
+  if (!historical_layout || segment.lexically_normal().string() != base_path || insert_log.filename() != "insert_log" ||
+      !is_id(segment) || !is_id(partition) || !is_id(collection)) {
+    // Generic storage-library tables do not carry Milvus segment identities,
+    // and later layouts have no historical encoding to recognize.
     if (!to_relative) {
       return ToAbsolute(index.path, base_path, milvus_storage::kIndexPath);
     }
@@ -382,7 +384,7 @@ static std::string ConvertIndexPath(const Index& index, const std::string& base_
       index.path.find('/') == std::string::npos) {
     return ToAbsolute(index.path, base_path, milvus_storage::kIndexPath);
   }
-  if (index.build_id <= 0 || index.index_version < 0 || index.index_store_path_version < 0) {
+  if (index.build_id <= 0 || index.index_version < 0) {
     return index.path;
   }
 
